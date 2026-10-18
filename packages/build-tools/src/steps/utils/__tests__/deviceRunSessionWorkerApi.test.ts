@@ -264,7 +264,7 @@ describe(DeviceRunSessionWorkerApi, () => {
   it('rejects an application response without the build field', async () => {
     jest.mocked(turtleFetch).mockResolvedValueOnce(jsonResponse({ data: { platform: 'ios' } }));
 
-    await expect(createApi().getApplicationAsync()).rejects.toThrow(
+    await expect(createApi().getApplicationAsync({ retries: 3 })).rejects.toThrow(
       'GET /v2/device-run-session-worker/application returned an unexpected response'
     );
   });
@@ -348,7 +348,7 @@ describe(DeviceRunSessionWorkerApi, () => {
       .mocked(turtleFetch)
       .mockResolvedValueOnce(jsonResponse({ data: { id: 'drs-id', status: 'STOPPED' } }));
 
-    await expect(createApi().getSessionAsync()).rejects.toThrow(
+    await expect(createApi().getSessionAsync({ retries: 3 })).rejects.toThrow(
       'GET /v2/device-run-session-worker/session returned an unexpected response'
     );
   });
@@ -356,7 +356,7 @@ describe(DeviceRunSessionWorkerApi, () => {
   it('rejects a successful response that is not JSON', async () => {
     jest.mocked(turtleFetch).mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
-    await expect(createApi().getSessionAsync()).rejects.toThrow(
+    await expect(createApi().getSessionAsync({ retries: 3 })).rejects.toThrow(
       'GET /v2/device-run-session-worker/session returned a response that is not JSON.'
     );
   });
@@ -379,7 +379,10 @@ describe('device run session worker API retries', () => {
         .mocked(turtleFetch)
         .mockResolvedValueOnce(new Response('unavailable', { status }))
         .mockResolvedValueOnce(jsonResponse({ data: { id: 'drs-id', status: 'in-progress' } }));
-      const result = createApi().startAsync({ remoteConfig: { url: 'https://preview.test' } });
+      const result = createApi().startAsync(
+        { remoteConfig: { url: 'https://preview.test' } },
+        { retries: 3, timeoutMs: 30_000 }
+      );
       const assertion = expect(result).resolves.toEqual({ id: 'drs-id', status: 'in-progress' });
       await jest.runAllTimersAsync();
       await assertion;
@@ -398,10 +401,9 @@ describe('device run session worker API retries', () => {
     jest
       .mocked(turtleFetch)
       .mockRejectedValueOnce(new Error('socket hang up'))
-      .mockResolvedValueOnce(jsonResponse({ data: { id: 'drs-id', status: 'stopped' } }));
-    const assertion = expect(createApi().stopAsync()).resolves.toEqual({
-      id: 'drs-id',
-      status: 'stopped',
+      .mockResolvedValueOnce(jsonResponse({ data: { build: null } }));
+    const assertion = expect(createApi().getApplicationAsync({ retries: 3 })).resolves.toEqual({
+      build: null,
     });
     await jest.runAllTimersAsync();
     await assertion;
@@ -412,7 +414,9 @@ describe('device run session worker API retries', () => {
     jest
       .mocked(turtleFetch)
       .mockImplementation(async () => new Response('unavailable', { status: 503 }));
-    const assertion = expect(createApi().startAsync({ remoteConfig: {} })).rejects.toMatchObject({
+    const assertion = expect(
+      createApi().startAsync({ remoteConfig: {} }, { retries: 3 })
+    ).rejects.toMatchObject({
       status: 503,
     });
     await jest.advanceTimersByTimeAsync(0);
@@ -428,15 +432,28 @@ describe('device run session worker API retries', () => {
 
   it.each([400, 401, 403, 404, 409])('does not retry HTTP %s', async status => {
     jest.mocked(turtleFetch).mockResolvedValueOnce(new Response('refused', { status }));
-    await expect(createApi().startAsync({ remoteConfig: {} })).rejects.toMatchObject({ status });
+    await expect(
+      createApi().startAsync({ remoteConfig: {} }, { retries: 3 })
+    ).rejects.toMatchObject({ status });
     expect(turtleFetch).toHaveBeenCalledTimes(1);
   });
 
-  it('lets polling disable retries', async () => {
+  it.each([
+    ['status polling', (api: DeviceRunSessionWorkerApi) => api.getSessionAsync()],
+    ['stop', (api: DeviceRunSessionWorkerApi) => api.stopAsync()],
+    [
+      'screenshot application metadata',
+      (api: DeviceRunSessionWorkerApi) => api.getApplicationAsync(),
+    ],
+    ['event log setup', (api: DeviceRunSessionWorkerApi) => api.createEventLogUploadSessionAsync()],
+    ['preview setup', (api: DeviceRunSessionWorkerApi) => api.createPreviewUploadSessionAsync()],
+    [
+      'TURN without an explicit retry option',
+      (api: DeviceRunSessionWorkerApi) => api.fetchTurnIceServersAsync(),
+    ],
+  ])('does not retry %s by default', async (_name, call) => {
     jest.mocked(turtleFetch).mockResolvedValueOnce(new Response('unavailable', { status: 503 }));
-    await expect(createApi().getSessionAsync({ retries: 0 })).rejects.toMatchObject({
-      status: 503,
-    });
+    await expect(call(createApi())).rejects.toMatchObject({ status: 503 });
     expect(turtleFetch).toHaveBeenCalledTimes(1);
   });
 
@@ -456,7 +473,7 @@ describe('device run session worker API retries', () => {
     const controller = new AbortController();
     jest.mocked(turtleFetch).mockResolvedValueOnce(new Response('unavailable', { status: 503 }));
     const assertion = expect(
-      createApi().getSessionAsync({ signal: controller.signal })
+      createApi().getApplicationAsync({ signal: controller.signal, retries: 3 })
     ).rejects.toMatchObject({ name: 'AbortError' });
     await jest.advanceTimersByTimeAsync(0);
     controller.abort();
@@ -486,7 +503,9 @@ describe('device run session retry safety', () => {
   it('does not send an already cancelled request', async () => {
     const controller = new AbortController();
     controller.abort();
-    await expect(createApi().getSessionAsync({ signal: controller.signal })).rejects.toMatchObject({
+    await expect(
+      createApi().getApplicationAsync({ signal: controller.signal, retries: 3 })
+    ).rejects.toMatchObject({
       name: 'AbortError',
     });
     expect(turtleFetch).not.toHaveBeenCalled();
@@ -506,7 +525,7 @@ describe('device run session retry safety', () => {
           .mockResolvedValueOnce(response)
           .mockResolvedValueOnce(jsonResponse({ data: { id: 'drs-id', status: 'in-progress' } }));
         const assertion = expect(
-          createApi().startAsync({ remoteConfig: {} })
+          createApi().startAsync({ remoteConfig: {} }, { retries: 3 })
         ).resolves.toMatchObject({ status: 'in-progress' });
         await jest.runAllTimersAsync();
         await assertion;

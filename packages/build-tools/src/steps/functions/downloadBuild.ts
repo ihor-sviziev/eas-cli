@@ -195,7 +195,11 @@ async function fetchDeviceRunSessionApplicationArchiveUrlAsync({
 }): Promise<string> {
   let application;
   try {
-    application = await deviceRunSessionWorkerApi.getApplicationAsync({ signal });
+    application = await deviceRunSessionWorkerApi.getApplicationAsync({
+      signal,
+      retries: 3,
+      timeoutMs: 30_000,
+    });
   } catch (err) {
     signal?.throwIfAborted();
     throw new SystemError(

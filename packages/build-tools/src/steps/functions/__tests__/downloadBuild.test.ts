@@ -615,51 +615,61 @@ describe('createDownloadBuildFunction', () => {
       );
     }
 
-    it('looks up build_id through the worker API and downloads without an Authorization header', async () => {
-      const buildId = randomUUID();
-      const graphqlClient = createMockGraphqlClient({});
-      jest.mocked(fetch).mockImplementation(async url => {
-        if (url === workerApiUrl) {
-          return new ActualResponse(
-            JSON.stringify({
-              data: {
-                build: {
-                  id: buildId,
-                  gitCommitHash: null,
-                  applicationArchiveUrl: APPLICATION_ARCHIVE_URL,
+    it.each([0, 1])(
+      'looks up build_id after %i transient failures and downloads without an Authorization header',
+      async failures => {
+        let remainingFailures = failures;
+        const buildId = randomUUID();
+        const graphqlClient = createMockGraphqlClient({});
+        jest.mocked(fetch).mockImplementation(async url => {
+          if (url === workerApiUrl) {
+            if (remainingFailures-- > 0) {
+              return new ActualResponse('Service Unavailable', { status: 503 });
+            }
+            return new ActualResponse(
+              JSON.stringify({
+                data: {
+                  build: {
+                    id: buildId,
+                    gitCommitHash: null,
+                    applicationArchiveUrl: APPLICATION_ARCHIVE_URL,
+                  },
                 },
-              },
-            }),
-            { status: 200 }
-          );
-        }
-        return {
-          ok: false,
-          text: () => Promise.resolve('Internal Server Error'),
-          status: 500,
-        } as unknown as Response;
-      });
+              }),
+              { status: 200 }
+            );
+          }
+          return {
+            ok: false,
+            text: () => Promise.resolve('Internal Server Error'),
+            status: 500,
+          } as unknown as Response;
+        });
 
-      await expect(
-        createStep(createSessionCtx(graphqlClient), {
-          build_id: buildId,
-          extensions: ['app'],
-        }).executeAsync()
-      ).rejects.toThrow('Internal Server Error');
+        await expect(
+          createStep(createSessionCtx(graphqlClient), {
+            build_id: buildId,
+            extensions: ['app'],
+          }).executeAsync()
+        ).rejects.toThrow('Internal Server Error');
 
-      expect(jest.mocked(fetch)).toHaveBeenCalledWith(
-        workerApiUrl,
-        expect.objectContaining({
-          method: 'GET',
-          headers: { 'expo-device-run-session-token': 'session-token' },
-        })
-      );
-      expect(jest.mocked(fetch)).toHaveBeenCalledWith(
-        APPLICATION_ARCHIVE_URL,
-        expect.objectContaining({ headers: undefined })
-      );
-      expect(graphqlClient.query).not.toHaveBeenCalled();
-    });
+        expect(jest.mocked(fetch)).toHaveBeenCalledWith(
+          workerApiUrl,
+          expect.objectContaining({
+            method: 'GET',
+            headers: { 'expo-device-run-session-token': 'session-token' },
+          })
+        );
+        expect(jest.mocked(fetch)).toHaveBeenCalledWith(
+          APPLICATION_ARCHIVE_URL,
+          expect.objectContaining({ headers: undefined })
+        );
+        expect(jest.mocked(fetch).mock.calls.filter(([url]) => url === workerApiUrl)).toHaveLength(
+          failures + 1
+        );
+        expect(graphqlClient.query).not.toHaveBeenCalled();
+      }
+    );
 
     it('does not call the worker API for an application_archive_url input', async () => {
       const graphqlClient = createMockGraphqlClient({});
