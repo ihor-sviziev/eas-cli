@@ -2818,7 +2818,13 @@ EXAMPLES
 
   $ eas simulator:control clipboard.write -- --some-text
 
-  $ eas simulator:control clipboard.write -- 'text=hello'
+  Write hello using the named text parameter (shell quotes do not change parsing):
+
+    $ eas simulator:control clipboard.write 'text=hello'
+
+  Write the literal text=hello using --:
+
+    $ eas simulator:control clipboard.write -- 'text=hello'
 
   $ eas simulator:control hardwareKeyboard.set off
 
@@ -3284,7 +3290,13 @@ EXAMPLES
 
   $ eas simulator:control clipboard.write -- --some-text
 
-  $ eas simulator:control clipboard.write -- 'text=hello'
+  Write hello using the named text parameter (shell quotes do not change parsing):
+
+    $ eas simulator:control clipboard.write 'text=hello'
+
+  Write the literal text=hello using --:
+
+    $ eas simulator:control clipboard.write -- 'text=hello'
 
   $ eas simulator:control hardwareKeyboard.set off
 
