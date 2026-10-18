@@ -236,6 +236,7 @@ async function fetchDeviceRunSessionStatusAsync(
     await requireDeviceRunSessionWorkerApi(ctx).getSessionAsync({
       signal,
       timeoutMs: DEVICE_RUN_SESSION_WORKER_REQUEST_TIMEOUT_MS,
+      retries: 0,
     })
   ).status;
 }
@@ -507,7 +508,7 @@ export async function uploadRemoteSessionConfigAsync({
   );
   const workerApi = requireDeviceRunSessionWorkerApi(ctx);
   try {
-    await workerApi.startAsync({ remoteConfig });
+    await workerApi.startAsync({ remoteConfig }, { logger });
   } catch (err) {
     throw new SystemError(
       `Failed to start device run session ${deviceRunSessionId}: ${
