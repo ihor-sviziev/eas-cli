@@ -189,6 +189,13 @@ export type Account = {
   /** Environment secrets for an account */
   environmentSecrets: Array<EnvironmentSecret>;
   environmentVariableEnvironments: Array<Scalars['EnvironmentVariableEnvironment']['output']>;
+  /**
+   * Whether the account turned on environment variable protection. When protection is on, using,
+   * creating, changing, or deleting a SECRET environment variable needs the PUBLISH_PROTECTED
+   * permission, in every project of the account. Expo can also turn protection on for an
+   * account; this field does not show that.
+   */
+  environmentVariableProtectionEnabled: Scalars['Boolean']['output'];
   /** Environment variables for an account */
   environmentVariables: Array<EnvironmentVariable>;
   /** Environment variables for an account with decrypted secret values */
@@ -770,6 +777,13 @@ export type AccountMutation = {
   revokeActorPermissions: Account;
   /** Set the display name for the account. Pass null to clear it and fall back to the account identifier. */
   setDisplayName: Account;
+  /**
+   * Set whether environment variable protection is on for this account. When it is on, using,
+   * creating, changing, or deleting a SECRET environment variable needs the PUBLISH_PROTECTED
+   * permission on the account, in every project of the account. Requires the ADMIN permission on
+   * the account. Turning protection off also requires a sudo session.
+   */
+  setEnvironmentVariableProtectionEnabled: Account;
   /** Set whether EAS Observe ingestion is paused for this account. */
   setObserveIngestionPaused: Account;
   /** Require authorization to send push notifications for experiences owned by this account */
@@ -845,6 +859,12 @@ export type AccountMutation_RevokeActorPermissionsArgs = {
 export type AccountMutation_SetDisplayNameArgs = {
   accountID: Scalars['ID']['input'];
   displayName?: InputMaybe<Scalars['String']['input']>;
+};
+
+
+export type AccountMutation_SetEnvironmentVariableProtectionEnabledArgs = {
+  accountID: Scalars['ID']['input'];
+  environmentVariableProtectionEnabled: Scalars['Boolean']['input'];
 };
 
 
@@ -6357,24 +6377,6 @@ export type CreateConvexTeamConnectionInput = {
   deploymentRegion: Scalars['String']['input'];
 };
 
-export type CreateDeviceRunSessionArtifactUploadSessionInput = {
-  filename: Scalars['String']['input'];
-  kind?: InputMaybe<Scalars['String']['input']>;
-  metadata?: InputMaybe<Scalars['JSONObject']['input']>;
-  name: Scalars['String']['input'];
-  size: Scalars['ByteSize']['input'];
-};
-
-export type CreateDeviceRunSessionArtifactUploadSessionResult = {
-  __typename?: 'CreateDeviceRunSessionArtifactUploadSessionResult';
-  uploadSession: DeviceRunSessionArtifactUploadSession;
-};
-
-export type CreateDeviceRunSessionEventLogUploadSessionResult = {
-  __typename?: 'CreateDeviceRunSessionEventLogUploadSessionResult';
-  uploadSession: DeviceRunSessionEventLogUploadSession;
-};
-
 export type CreateDeviceRunSessionInput = {
   /**
    * The coding agent sending this request, recorded for analytics only and never used for
@@ -6407,6 +6409,13 @@ export type CreateDeviceRunSessionInput = {
    * Mutually exclusive with buildFingerprint, applicationArchiveUrl, and expoGo.
    */
   buildId?: InputMaybe<Scalars['ID']['input']>;
+  /**
+   * Origins of pages that may call the session's preview host API cross-origin, for example to
+   * render the device with @expo/hub-client. Framing the preview does not need this. Same value
+   * rules as frameAncestors. At most 10. The page still needs the preview token from remoteConfig.
+   * If omitted, only expo.dev may call the preview API cross-origin.
+   */
+  corsOrigins?: InputMaybe<Array<Scalars['String']['input']>>;
   /**
    * Where the virtual device's proxied network traffic exits to the internet. If
    * omitted, all traffic exits from EAS infrastructure.
@@ -6564,13 +6573,6 @@ export type CreateGitHubRepositorySettingsInput = {
 };
 
 export type CreateIosDeviceRunSessionInput = {
-  /**
-   * Origins of pages that may call the session's preview host API cross-origin, for example to
-   * render the device with @expo/hub-client. Framing the preview does not need this. Same value
-   * rules as frameAncestors. At most 10. The page still needs the preview token from remoteConfig.
-   * If omitted, only expo.dev may call the preview API cross-origin.
-   */
-  corsOrigins?: InputMaybe<Array<Scalars['String']['input']>>;
   /** Simulator device name or UDID to use for the session (e.g. "iPhone 16 Pro"). */
   deviceIdentifier?: InputMaybe<Scalars['String']['input']>;
 };
@@ -7134,12 +7136,6 @@ export type DeviceRunSessionArtifactQuery_ByIdArgs = {
   deviceRunSessionArtifactId: Scalars['ID']['input'];
 };
 
-export type DeviceRunSessionArtifactUploadSession = {
-  __typename?: 'DeviceRunSessionArtifactUploadSession';
-  headers: Scalars['JSONObject']['output'];
-  url: Scalars['String']['output'];
-};
-
 /**
  * Where the virtual device's proxied network traffic exits to the internet. When
  * unset, all traffic exits from EAS infrastructure.
@@ -7156,12 +7152,6 @@ export enum DeviceRunSessionEgress {
   Local = 'LOCAL'
 }
 
-export type DeviceRunSessionEventLogUploadSession = {
-  __typename?: 'DeviceRunSessionEventLogUploadSession';
-  headers: Scalars['JSONObject']['output'];
-  url: Scalars['String']['output'];
-};
-
 export type DeviceRunSessionFilterInput = {
   /** Case-insensitive match anywhere in the session name. */
   name?: InputMaybe<Scalars['String']['input']>;
@@ -7174,20 +7164,8 @@ export type DeviceRunSessionFilterInput = {
 
 export type DeviceRunSessionMutation = {
   __typename?: 'DeviceRunSessionMutation';
-  /** Create an upload session for an artifact while the backing job run is not in a final state */
-  createArtifactUploadSession: CreateDeviceRunSessionArtifactUploadSessionResult;
   /** Create a device run session */
   createDeviceRunSession: DeviceRunSession;
-  /**
-   * Create or reuse a standard artifact and a two-hour upload URL for repeatedly
-   * overwriting its structured event log while the backing job run is running.
-   */
-  createEventLogUploadSession: CreateDeviceRunSessionEventLogUploadSessionResult;
-  /**
-   * Create or renew a two-hour upload URL for overwriting the session preview.
-   * Reuses one WebP artifact while the backing job run is active.
-   */
-  createPreviewUploadSession: CreateDeviceRunSessionArtifactUploadSessionResult;
   /**
    * Permanently delete a finished session and its artifacts. The backing job,
    * if present, must also have finished. Returns the deleted session ID.
@@ -7199,8 +7177,6 @@ export type DeviceRunSessionMutation = {
    * ERRORED).
    */
   ensureDeviceRunSessionStopped: DeviceRunSession;
-  /** Mark a device run session as started and persist remote connection details */
-  startDeviceRunSession: DeviceRunSession;
   /**
    * Update a device run session name and tags, including on sessions
    * that have already finished.
@@ -7209,24 +7185,8 @@ export type DeviceRunSessionMutation = {
 };
 
 
-export type DeviceRunSessionMutation_CreateArtifactUploadSessionArgs = {
-  deviceRunSessionId: Scalars['ID']['input'];
-  input: CreateDeviceRunSessionArtifactUploadSessionInput;
-};
-
-
 export type DeviceRunSessionMutation_CreateDeviceRunSessionArgs = {
   deviceRunSessionInput: CreateDeviceRunSessionInput;
-};
-
-
-export type DeviceRunSessionMutation_CreateEventLogUploadSessionArgs = {
-  deviceRunSessionId: Scalars['ID']['input'];
-};
-
-
-export type DeviceRunSessionMutation_CreatePreviewUploadSessionArgs = {
-  deviceRunSessionId: Scalars['ID']['input'];
 };
 
 
@@ -7237,12 +7197,6 @@ export type DeviceRunSessionMutation_DeleteDeviceRunSessionArgs = {
 
 export type DeviceRunSessionMutation_EnsureDeviceRunSessionStoppedArgs = {
   deviceRunSessionId: Scalars['ID']['input'];
-};
-
-
-export type DeviceRunSessionMutation_StartDeviceRunSessionArgs = {
-  deviceRunSessionId: Scalars['ID']['input'];
-  remoteConfig: Scalars['JSONObject']['input'];
 };
 
 
@@ -7528,7 +7482,9 @@ export enum EntityTypeName {
   ConvexProjectEntity = 'ConvexProjectEntity',
   ConvexTeamConnectionEntity = 'ConvexTeamConnectionEntity',
   CustomerEntity = 'CustomerEntity',
+  /** @deprecated This entity type was deleted. Existing audit logs can still reference it. */
   EchoProjectEntity = 'EchoProjectEntity',
+  /** @deprecated This entity type was deleted. Existing audit logs can still reference it. */
   EchoVersionEntity = 'EchoVersionEntity',
   EnvironmentVariableEntity = 'EnvironmentVariableEntity',
   GoogleServiceAccountKeyEntity = 'GoogleServiceAccountKeyEntity',
@@ -10002,7 +9958,7 @@ export type RootMutation = {
   deployments: DeploymentsMutation;
   /** Mutations that assign or modify DevDomainNames for apps */
   devDomainName: AppDevDomainNameMutation;
-  /** Mutations that create, start, stop, and update device run sessions */
+  /** Mutations that create, stop, update, and delete device run sessions */
   deviceRunSession: DeviceRunSessionMutation;
   /** Mutations for Discord users */
   discordUser: DiscordUserMutation;
