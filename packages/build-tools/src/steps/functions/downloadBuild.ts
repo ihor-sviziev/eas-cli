@@ -7,7 +7,7 @@ import {
   BuildStepInputValueTypeName,
   BuildStepOutput,
 } from '@expo/steps';
-import { Client } from '@urql/core';
+import { Client, CombinedError } from '@urql/core';
 import contentDisposition from 'content-disposition';
 import { glob } from 'fast-glob';
 import { graphql } from 'gql.tada';
@@ -23,17 +23,113 @@ import bplistParser from 'bplist-parser';
 import plist from 'plist';
 
 import { CustomBuildContext } from '../../customBuildContext';
+import { Datadog } from '../../datadog';
 import { formatBytes } from '../../utils/artifacts';
 import { decompressTarAsync, isFileTarGzAsync } from '../../utils/files';
 import { graphqlAbortContext } from '../../utils/graphqlAbort';
-import { retryOnDNSFailure } from '../../utils/retryOnDNSFailure';
+import { isConnectionInterruptedError } from '../../utils/networkErrors';
+import { promiseRetryWithCondition } from '../../utils/promiseRetryWithCondition';
 import { pluralize } from '../../utils/strings';
 import {
   type DeviceRunSessionWorkerApi,
+  DeviceRunSessionWorkerApiError,
   getDeviceRunSessionWorkerApi,
 } from '../utils/deviceRunSessionWorkerApi';
 
 const streamPipeline = promisify(stream.pipeline);
+
+const NETWORK_RETRY_OPTIONS = { retries: 5, minTimeout: 1_000, factor: 2 };
+
+/** Errno code of the error or its causes; undici keeps it on cause, urql on networkError. */
+function findErrorCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  while (current instanceof Error) {
+    if ('code' in current && typeof current.code === 'string') {
+      return current.code;
+    }
+    current = current instanceof CombinedError ? current.networkError : current.cause;
+  }
+  return undefined;
+}
+
+function describeError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = findErrorCode(error);
+  return code && !message.includes(code) ? `${message.trimEnd()} (${code})` : message;
+}
+
+// node-fetch throws type 'system' for a socket failure before the headers; after them it forwards
+// ECONNRESET or ERR_STREAM_PREMATURE_CLOSE to the body. HTTP error responses never throw.
+function isArchiveTransferError(error: unknown): boolean {
+  return (
+    (error instanceof Error &&
+      error.name === 'FetchError' &&
+      'type' in error &&
+      error.type === 'system') ||
+    isConnectionInterruptedError(error) ||
+    findErrorCode(error) === 'ERR_STREAM_PREMATURE_CLOSE'
+  );
+}
+
+const RETRIED_REQUEST_LABELS = {
+  build_lookup: 'Build lookup',
+  archive_download: 'Archive download',
+} as const;
+
+async function retryOnNetworkFailureAsync<T>(
+  attemptAsync: () => Promise<T>,
+  {
+    request,
+    signal,
+    isRetryable,
+  }: {
+    request: keyof typeof RETRIED_REQUEST_LABELS;
+    signal?: AbortSignal;
+    isRetryable: (error: unknown) => boolean;
+  }
+): Promise<T> {
+  let retries = 0;
+  const report = (outcome: 'recovered' | 'exhausted', lastError: unknown): void => {
+    Datadog.log(`${RETRIED_REQUEST_LABELS[request]} ${outcome} on attempt ${retries + 1}`, {
+      event: 'download_build_network_retry',
+      request,
+      outcome,
+      attempts: String(retries + 1),
+      code: findErrorCode(lastError) ?? 'unknown',
+    });
+  };
+
+  let lastRetriedError: unknown;
+  try {
+    const result = await promiseRetryWithCondition(
+      async () => {
+        signal?.throwIfAborted();
+        return await attemptAsync();
+      },
+      error => !signal?.aborted && isRetryable(error),
+      NETWORK_RETRY_OPTIONS,
+      ({ attemptNumber, error }) => {
+        retries = attemptNumber - 1;
+        lastRetriedError = error;
+      }
+    )();
+    if (retries > 0) {
+      report('recovered', lastRetriedError);
+    }
+    return result;
+  } catch (error) {
+    const lastAttemptFailedTransiently =
+      retries === NETWORK_RETRY_OPTIONS.retries && !signal?.aborted && isRetryable(error);
+    if (lastAttemptFailedTransiently) {
+      report('exhausted', error);
+    }
+    throw error;
+  }
+}
+
+function isServerSideLookupError(error: CombinedError): boolean {
+  return Boolean(error.networkError) || error.response?.status >= 500;
+}
 
 type DownloadBuildSource =
   | { buildId: string; applicationArchiveUrl?: never }
@@ -152,18 +248,38 @@ async function fetchApplicationArchiveUrlAsync({
       signal,
     });
   }
-  const result = await graphqlClient
-    .query(BUILD_BY_ID_QUERY, { buildId }, graphqlAbortContext(signal))
-    .toPromise();
+  let result;
+  try {
+    result = await retryOnNetworkFailureAsync(
+      async () => {
+        const queryResult = await graphqlClient
+          .query(BUILD_BY_ID_QUERY, { buildId }, graphqlAbortContext(signal))
+          .toPromise();
+        if (queryResult.error && isServerSideLookupError(queryResult.error)) {
+          throw queryResult.error;
+        }
+        return queryResult;
+      },
+      {
+        request: 'build_lookup',
+        signal,
+        isRetryable: error => error instanceof CombinedError && isServerSideLookupError(error),
+      }
+    );
+  } catch (error) {
+    signal?.throwIfAborted();
+    throw new SystemError(`Could not fetch build ${buildId}: ${describeError(error)}`, {
+      cause: error,
+    });
+  }
   signal?.throwIfAborted();
 
   if (result.error) {
-    const { error } = result;
-    const message = `Could not fetch build ${buildId}: ${error.message}`;
-
-    throw error.networkError || result.error.response?.status >= 500
-      ? new SystemError(message, { cause: error })
-      : new UserError('EAS_DOWNLOAD_BUILD_FETCH_FAILED', message, { cause: error });
+    throw new UserError(
+      'EAS_DOWNLOAD_BUILD_FETCH_FAILED',
+      `Could not fetch build ${buildId}: ${result.error.message}`,
+      { cause: result.error }
+    );
   }
 
   const applicationArchiveUrl = result.data?.builds.byId?.artifacts?.applicationArchiveUrl;
@@ -195,13 +311,20 @@ async function fetchDeviceRunSessionApplicationArchiveUrlAsync({
 }): Promise<string> {
   let application;
   try {
-    application = await deviceRunSessionWorkerApi.getApplicationAsync({ signal });
+    application = await retryOnNetworkFailureAsync(
+      () => deviceRunSessionWorkerApi.getApplicationAsync({ signal }),
+      {
+        request: 'build_lookup',
+        signal,
+        isRetryable: error =>
+          error instanceof DeviceRunSessionWorkerApiError &&
+          (error.status === undefined || error.status >= 500),
+      }
+    );
   } catch (err) {
     signal?.throwIfAborted();
     throw new SystemError(
-      `Could not fetch build ${buildId} for this device run session: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `Could not fetch build ${buildId} for this device run session: ${describeError(err)}`,
       { cause: err }
     );
   }
@@ -280,19 +403,36 @@ export async function downloadBuildAsync(
     path.join(os.tmpdir(), 'download_build-downloaded-')
   );
 
+  const isUserSuppliedArchive = params.applicationArchiveUrl !== undefined;
   signal?.throwIfAborted();
-  const response = await retryOnDNSFailure(fetch)(downloadUrl, { headers, signal });
-
-  if (!response.ok) {
-    const textResult = await asyncResult(response.text());
-    throw new Error(`Unexpected response from server (${response.status}): ${textResult.value}`);
+  let archivePath: string;
+  try {
+    archivePath = await retryOnNetworkFailureAsync(
+      async () => {
+        const response = await fetch(downloadUrl, { headers, signal });
+        if (!response.ok) {
+          const textResult = await asyncResult(response.text());
+          throw new Error(
+            `Unexpected response from server (${response.status}): ${textResult.value}`
+          );
+        }
+        const archiveFilename = resolveArchiveFilename({ response, extensions });
+        const attemptArchivePath = path.join(downloadDestinationDirectory, archiveFilename);
+        // On abort, node-fetch emits an error on the body stream, which fails the pipeline.
+        await streamPipeline(response.body, fs.createWriteStream(attemptArchivePath));
+        return attemptArchivePath;
+      },
+      { request: 'archive_download', signal, isRetryable: isArchiveTransferError }
+    );
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (isUserSuppliedArchive || !isArchiveTransferError(error)) {
+      throw error;
+    }
+    throw new SystemError(`Could not download the application archive: ${describeError(error)}`, {
+      cause: error,
+    });
   }
-
-  const archiveFilename = resolveArchiveFilename({ response, extensions });
-  const archivePath = path.join(downloadDestinationDirectory, archiveFilename);
-
-  // On abort, node-fetch emits an error on the body stream, which fails the pipeline.
-  await streamPipeline(response.body, fs.createWriteStream(archivePath));
   signal?.throwIfAborted();
 
   const { size } = await fs.promises.stat(archivePath);
